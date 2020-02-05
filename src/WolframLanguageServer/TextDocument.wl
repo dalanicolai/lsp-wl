@@ -22,6 +22,7 @@ FindDefinitions::usage = "FindDefinitions[doc_TextDocument, pos_LspPosition] giv
 FindReferences::usage = "FindReferences[doc_TextDocument, pos_LspPosition, o:OptionsPattern[]] gives the references of the symbol at the position."
 FindDocumentHighlight::usage = "FindDocumentHighlight[doc_TextDocument, pos_LspPosition] gives a list of DocumentHighlight."
 FindAllCodeRanges::usage = "FindAllCodeRanges[doc_TextDocument] returns a list of LspRange which locate all the code ranges (cells) in the given doc."
+GetDocumentText::usage = "GetDocumentText[doc_TextDocument, range_LspRange] returns the text of the doc at given range."
 FindDocumentColor::usage = "FindDocumentColor[doc_TextDocument] gives a list of colors in the text document."
 GetColorPresentation::usage = "GetColorPresentation[doc_TextDocument, color_LspColor, range_LspRange] gives the RGBColor presentation of the color."
 
@@ -565,6 +566,19 @@ FindAllCodeRanges[doc_TextDocument] := (
     ]
     // Catenate
     // Map[Curry[ToLspRange, 2][doc]]
+)
+
+GetDocumentText[doc_TextDocument, range_LspRange] := (
+    doc["text"]
+    // Take[#, {
+        range["start"]["line"] + 1,
+        range["end"]["line"] + 1
+    }]&
+    // ReplacePart[#, 1 ->
+        StringDrop[First[#], range["start"]["character"]]]&
+    // ReplacePart[#, -1 ->
+        StringTake[Last[#], range["end"]["character"]]]&
+    // StringRiffle[#, "\n"]&
 )
 
 

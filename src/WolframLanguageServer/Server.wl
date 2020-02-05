@@ -48,6 +48,7 @@ DeclareType[WorkState, <|
 	"debugSession" -> _DebugSession,
 	"scheduledTasks" -> {___ServerTask},
 	"caches" -> _Association,
+	"pendingServerRequests" -> _Association,
 	"config" -> _Association
 |>]
 
@@ -80,6 +81,7 @@ InitialState = WorkState[<|
 	|>],
 	"scheduledTasks" -> {},
 	"caches" -> initialCaches,
+	"pendingServerRequests" -> <||>,
 	"config" -> <|
 		"configFileConfig" -> loadConfig[]
 	|>
@@ -713,6 +715,7 @@ CloseClient[client_NamedPipe] := With[
 
 NotificationQ = KeyExistsQ["id"] /* Not
 (* NotificationQ[msg_Association] := MissingQ[msg["id"]] *)
+ResponseQ = And[KeyExistsQ["method"] /* Not, KeyExistsQ["id"]] /* Through
 
 handleMessageList[msgs:{___Association}, state_WorkState] := (
     FoldWhile[handleMessage[#2, Last[#1]]&, {"Continue", state}, msgs, MatchQ[{"Continue", _}]]
@@ -727,7 +730,7 @@ handleMessage[msg_Association, state_WorkState] := With[
 		(* wrong message before initialization *)
 		!state["initialized"] && !MemberQ[{"initialize", "initialized", "exit"}, method],
 		If[!NotificationQ[msg],
-			sendResponse[state["client"], <|
+			sendMessage[state["client"], <|
 				"id" -> msg["id"],
 				"error" -> ServerError[
 					"ServerNotInitialized",
@@ -740,6 +743,9 @@ handleMessage[msg_Association, state_WorkState] := With[
 		(* notification*)
 		NotificationQ[msg],
 		handleNotification[method, msg, state],
+		(* response *)
+		ResponseQ[msg],
+		handleResponse[state["pendingServerRequests"][msg["id"]], msg, state],
 		(* resquest *)
 		True,
 		Which[
@@ -821,7 +827,7 @@ sendCachedResult[method_String, msg_, state_WorkState] := Block[
 		cache = getCache[method, msg, state]
 	},
 
-	sendResponse[state["client"],
+	sendMessage[state["client"],
 		<|"id" -> msg["id"]|>
 		// Append[
 			If[!MissingQ[cache["result"]],
@@ -854,7 +860,7 @@ scheduleDelayedRequest[method_String, msg_, state_WorkState] := (
 
 
 (* response, notification and request will call this function *)
-sendResponse[client_, res_Association] := (
+sendMessage[client_, res_Association] := (
 	Prepend[res, <|"jsonrpc" -> "2.0"|>]
 	// constructRPCBytes
 	// WriteMessage[client]
@@ -867,7 +873,7 @@ sendResponse[client_, res_Association] := (
 
 handleRequest["initialize", msg_, state_WorkState] := (
 
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"id" -> msg["id"],
 		"result" -> <|
 			"capabilities" -> ServerCapabilities
@@ -893,7 +899,7 @@ handleRequest["shutdown", msg_, state_] := Module[
 	{
 	},
 
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"id" -> msg["id"],
 		"result" -> Null
 	|>];
@@ -933,7 +939,7 @@ handleRequest["workspace/executeCommand", msg_, state_] := With[
 
 
 handleRequest["textDocument/publishDiagnostics", uri_String, state_WorkState] := (
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"method" -> "textDocument/publishDiagnostics",
 		"params" -> <|
 			"uri" -> uri,
@@ -945,7 +951,7 @@ handleRequest["textDocument/publishDiagnostics", uri_String, state_WorkState] :=
 
 
 handleRequest["textDocument/clearDiagnostics", uri_String, state_WorkState] := (
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"method" -> "textDocument/publishDiagnostics",
 		"params" -> <|
 			"uri" -> uri,
@@ -971,7 +977,7 @@ handleRequest["textDocument/hover", msg_, state_] := With[
 		pos = LspPosition[msg["params"]["position"]]
 	},
 
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"id" -> msg["id"],
 		"result" -> ToAssociation[GetHoverAtPosition[doc, pos]]
 	|>];
@@ -993,7 +999,7 @@ handleRequest["textDocument/completion", msg_, state_] := Module[
 	msg["params"]["context"]["triggerKind"]
 	// Replace[{
 		CompletionTriggerKind["Invoked"] :> (
-			sendResponse[state["client"], <|
+			sendMessage[state["client"], <|
 				"id" -> msg["id"],
 				"result" -> <|
 					"isIncomplete" -> False,
@@ -1002,7 +1008,7 @@ handleRequest["textDocument/completion", msg_, state_] := Module[
 			|>]
 		),
 		CompletionTriggerKind["TriggerCharacter"] :> (
-			sendResponse[state["client"], <|
+			sendMessage[state["client"], <|
 				"id" -> msg["id"],
 				"result" -> <|
 					"isIncomplete" -> True,
@@ -1014,7 +1020,7 @@ handleRequest["textDocument/completion", msg_, state_] := Module[
 			|>]
 		),
 		CompletionTriggerKind["TriggerForIncompleteCompletions"] :> (
-			sendResponse[state["client"], <|
+			sendMessage[state["client"], <|
 				"id" -> msg["id"],
 				"result" -> <|
 					"isIncomplete" -> False,
@@ -1050,13 +1056,13 @@ handleRequest["completionItem/resolve", msg_, state_] := With[
 	msg["params"]["data"]["type"]
 	// Replace[{
 		"Alias" | "LongName" :> (
-			sendResponse[state["client"], <|
+			sendMessage[state["client"], <|
 				"id" -> msg["id"],
 				"result" -> msg["params"]
 			|>] 
 		),
 		"Token" :> (
-			sendResponse[state["client"], <|
+			sendMessage[state["client"], <|
 				"id" -> msg["id"],
 				"result" -> <|
 					msg["params"]
@@ -1091,7 +1097,7 @@ handleRequest["textDocument/definition", msg_, state_] := With[
 		pos = LspPosition[msg["params"]["position"]]
 	},
 
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"id" -> msg["id"],
 		"result" -> ToAssociation@FindDefinitions[doc, pos]
 	|>] // AbsoluteTiming // First // LogDebug;
@@ -1111,7 +1117,7 @@ handleRequest["textDocument/references", msg_, state_] := With[
 		includeDeclaration = msg["params"]["context"]["includeDeclaration"]
 	},
 
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"id" -> msg["id"],
 		"result" -> ToAssociation@FindReferences[doc, pos, "IncludeDeclaration" -> includeDeclaration]
 	|>] // AbsoluteTiming // First // LogDebug;
@@ -1131,7 +1137,7 @@ handleRequest[method:"textDocument/documentHighlight", msg_, state_WorkState] :=
 		pos = LspPosition[msg["params"]["position"]]
 	},
 
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"id" -> id,
 		"result" -> (
 			FindDocumentHighlight[state["openedDocs"][uri], pos]
@@ -1209,7 +1215,7 @@ handleRequest["textDocument/codeLens", msg_, state_] := With[
 		uri = msg["params"]["textDocument"]["uri"]
 	},
 
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"id" -> id,
 		"result" -> (
 			{
@@ -1282,7 +1288,7 @@ handleRequest["codeLens/resolve", msg_, state_] := With[
 		codeLens = msg["params"]
 	},
 
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"id" -> id,
 		"result" -> ToAssociation[
 			ConstructType[codeLens, CodeLens]
@@ -1359,7 +1365,7 @@ handleRequest["textDocument/colorPresentation", msg_, state_] := With[
 		range = msg["params"]["range"] // LspRange
 	},
 
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"id" -> msg["id"],
 		"result" -> (
 			GetColorPresentation[doc, color, range]
@@ -1384,7 +1390,7 @@ handleRequest["textDocument/colorPresentation", msg_, state_] := With[
 
 
 handleRequest[_, msg_, state_] := (
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"id" -> msg["id"],
 		"error" -> ServerError["MethodNotFound",
 			msg
@@ -1452,7 +1458,7 @@ handleNotification["$/cancelRequest", msg_, state_] := With[
 			Part[state["scheduledTasks"], pos]["type"]
 			// Curry[StringJoin][" request is cancelled."]
 			// LogDebug;
-			sendResponse[state["client"], <|
+			sendMessage[state["client"], <|
 				"id" -> id,
 				"error" -> ServerError[
 					"RequestCancelled",
@@ -1621,6 +1627,81 @@ handleNotification[_, msg_, state_] := (
 
 
 (* ::Section:: *)
+(*Send Request*)
+
+
+$requestId = 0
+getRequestId[] := (
+	"req_" <> ToString[($requestId += 1)]
+)
+
+(* ::Subsection:: *)
+(*applyEdit*)
+
+sendRequest[method:"workspace/applyEdit", msg_, state_WorkState] := With[
+	{
+		id = getRequestId[]
+	},
+
+	sendMessage[state["client"], <|
+		"id" -> id,
+		"method" -> "workspace/applyEdit",
+		"params" -> <|
+			"edit" -> msg["params"]["edit"]
+		|>
+	|>];
+
+	{
+		"Continue",
+		state
+		// ReplaceKeyBy["pendingServerRequests" -> Append[id -> method]]
+	}
+]
+
+applyEdit["dummyAll", state_WorkState] := (
+	sendRequest[
+		"workspace/applyEdit",
+		Table[uri -> {
+			TextEdit[<|
+				"range" -> LspRange[<|
+					"start" -> <|
+						"line" -> 0,
+						"character" -> 0
+					|>,
+					"end" -> <|
+						"line" -> 0,
+						"character" -> 1
+					|>
+				|>],
+				"newText" -> (
+					state["openedDocs"][uri]["text"]
+					// First
+					// StringTake[#, 1]&
+				)
+			|>]
+		}, {uri, Keys[state["openedDocs"]]}]
+		// WorkspaceEdit[<|"changes" -> <|#|>|>]&
+		// ToAssociation
+		// <|"params" -> <|"edit" -> #|>|>&,
+		state
+	]
+)
+
+
+(* ::Section:: *)
+(*Handle Response*)
+
+
+handleResponse["workspace/applyEdit", msg_, state_WorkState] := (
+	{
+		"Continue",
+		state
+		// DeleteKey[{"pendingServerRequests", msg["id"]}]
+	}
+)
+
+
+(* ::Section:: *)
 (*Handle Dap Request*)
 
 
@@ -1660,7 +1741,7 @@ showMessage[message_String, msgType_String, state_WorkState] := (
 	// Replace[_?MissingQ :> MessageType["Error"]]
 	// LogDebug
 	// (type \[Function] 
-		sendResponse[state["client"], <|
+		sendMessage[state["client"], <|
 			"method" -> "window/showMessage", 
 			"params" -> <|
 				"type" -> type,
@@ -1675,7 +1756,7 @@ logMessage[message_String, msgType_String, state_WorkState] := (
 	// Replace[_?MissingQ :> MessageType["Error"]]
 	// LogDebug
 	// (type \[Function] 
-		sendResponse[state["client"], <|
+		sendMessage[state["client"], <|
 			"method" -> "window/logMessage", 
 			"params" -> <|
 				"type" -> type,
@@ -1793,11 +1874,11 @@ doNextScheduledTask[state_WorkState] := (
 						(* if there will not be a same task in the future, do it now *)
 						_?MissingQ :> If[!MissingQ[task["callback"]],
 							(* If the function is time constrained, than the there should not be a lot of lags. *)
-							(* TimeConstrained[task["callback"][newState, task["params"]], 0.1, sendResponse[state["client"], <|"id" -> task["params"]["id"], "result" -> <||>|>]], *)
+							(* TimeConstrained[task["callback"][newState, task["params"]], 0.1, sendMessage[state["client"], <|"id" -> task["params"]["id"], "result" -> <||>|>]], *)
 							task["callback"][newState, task["params"]]
 							// AbsoluteTiming
 							// Apply[(LogInfo[{task["type"], #1}];#2)&],
-							sendResponse[newState["client"], <|
+							sendMessage[newState["client"], <|
 								"id" -> task["id"],
 								"error" -> ServerError[
 									"InternalError",
@@ -1811,7 +1892,7 @@ doNextScheduledTask[state_WorkState] := (
 							(* execute fallback function if applicable *)
 							task["duplicateFallback"][newState, task["params"]],
 							(* otherwise, return ContentModified error *)
-							sendResponse[newState["client"], <|
+							sendMessage[newState["client"], <|
 								"id" -> task["id"],
 								"error" -> ServerError[
 									"ContentModified",
@@ -1978,6 +2059,7 @@ WLServerVersion[] := WolframLanguageServer`Version;
 
 
 WLServerDebug[] := Print["This is a debug function."];
+
 
 
 End[];
