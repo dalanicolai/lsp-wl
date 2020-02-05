@@ -55,7 +55,10 @@ DeclareType[WorkState, <|
 DeclareType[DebugSession, <|
 	"initialized" -> _?BooleanQ,
 	"server" -> _SocketObject | Null,
-	"client" -> _SocketObject | Null
+	"client" -> _SocketObject | Null,
+	"subKernel" -> _,
+	"context" -> _String,
+	"thread" -> _DapThread
 |>]
 
 DeclareType[RequestCache, <|
@@ -76,6 +79,7 @@ InitialState = WorkState[<|
 	"openedDocs" -> <||>,
 	"client" -> Null,
 	"debugSession" -> DebugSession[<|
+		"initialized" -> False,
 		"server" -> Null,
 		"client" -> Null
 	|>],
@@ -414,7 +418,7 @@ TcpSocketHandler[state_WorkState] := With[
 		Length[debugSession["server"]["ConnectedClients"]] > 0,
 		{
 			"Continue",
-			ReplaceKey[state, {"debugSession", "client"} -> First[LogDebug@debugSession["server"]["ConnectedClients"]]]
+			ReplaceKey[state, {"debugSession", "client"} -> First[debugSession["server"]["ConnectedClients"]]]
 		},
 		debugSession["client"] =!= Null && SocketReadyQ[debugSession["client"]],
 		handleDapMessageList[ReadMessages[debugSession["client"]], state],
@@ -785,11 +789,11 @@ handleDapMessage[msg_Association, state_WorkState] := Module[
 
 	Which[
 		(* wrong message before initialization *)
-		!state["debuggerInitialized"] &&
+		!state["debugSession"]["Initialized"] &&
 		msg["type"] != "request" &&
 		!MemberQ[{"initialize"}, msg["command"]],
 		If[msg["type"] == "request",
-			sendResponse[state["dubugSession"]["client"], <|
+			sendMessage[state["dubugSession"]["client"], <|
 				"type" -> "response",
 				"request_seq" -> msg["seq"],
 				"success" -> False,
@@ -802,8 +806,8 @@ handleDapMessage[msg_Association, state_WorkState] := Module[
 			(* otherwise, dropped the notification *)
 		];
 		{"Continue", state},
-		(* notification*)
-		msg["event"],
+		(* event*)
+		msg["type"] == "event",
 		handleDapEvent[msg["event"], msg, newState],
 		(* resquest *)
 		True,
@@ -871,7 +875,12 @@ sendMessage[client_, res_Association] := (
 (*initialize*)
 
 
-handleRequest["initialize", msg_, state_WorkState] := (
+handleRequest["initialize", msg_, state_WorkState] := With[
+    {
+        debugPort = Fold[Replace[#1, _?MissingQ -> <||>][#2]&,
+            msg, {"params", "initializationOptions", "debuggerPort"}
+        ]
+    },
 
 	sendMessage[state["client"], <|
 		"id" -> msg["id"],
@@ -884,11 +893,15 @@ handleRequest["initialize", msg_, state_WorkState] := (
 	{
 		"Continue",
 		Fold[ReplaceKey, state, {
-				"clientCapabilities" -> msg["params"]["capabilities"]
-				(* {"debugSession", "server"} -> SocketOpen[8216] *)
+			"clientCapabilities" -> msg["params"]["capabilities"],
+			If[!MissingQ[debugPort],
+				LogInfo["Debugger listening at port " <> ToString[debugPort]];
+				{"debugSession", "server"} -> SocketOpen[debugPort],
+				Nothing
+			]
 		}]
 	}
-)
+]
 
 
 (* ::Subsection:: *)
@@ -918,19 +931,80 @@ handleRequest["workspace/executeCommand", msg_, state_] := With[
 		args = msg["params"]["arguments"]
 	},
 
-	Replace[command, {
-		"dap-wl.runfile" -> (
-			LogInfo[StringJoin["executing ", command, "with arguments: ", ToString[args]]]
-		)
+	LogDebug[StringJoin["executing ", command, " with arguments: ", ToString[args]]];
+	executeCommand[command, msg, state]
+]
+
+
+(* ::Subsubsection:: *)
+(*dap-wl.run-file*)
+
+
+executeCommand["dap-wl.run-file", msg_, state_WorkState] := With[
+	{
+		args = msg["params"]["arguments"] // First
+	},
+
+	LogDebug[{"Running",
+		args["uri"]
 	}];
 
-	sendResponse[state["client"], <|
+	sendMessage[state["client"], <|
 		"id" -> msg["id"],
 		"result" -> Null
 	|>];
 
 	{"Continue", state}
+]
 
+
+(* ::Subsubsection:: *)
+(*dap-wl.run-range*)
+
+
+executeCommand["dap-wl.run-range", msg_, state_WorkState] := Block[
+	{
+		args = msg["params"]["arguments"] // First,
+		text, res
+	},
+
+	text = GetDocumentText[
+		state["openedDocs"][args["uri"]],
+		ConstructType[args["range"], _LspRange]
+	];
+
+	res = With[{text = text},
+		ParallelEvaluate[
+			ToExpression[text],
+			state["debugSession"]["subKernel"]
+		]
+	] // ToString;
+
+	sendMessage[state["debugSession"]["client"], <|
+		"type" -> "event",
+		"event" -> "output",
+		"body" -> <|
+			"category" -> "console",
+			"output" -> StringJoin[text, "\n", res],
+			"variableReference" -> 1
+		|>
+	|>];
+
+	sendMessage[state["debugSession"]["client"], <|
+		"type" -> "event",
+		"event" -> "breakpoint",
+		"body" -> <|
+			"reason" -> "goto",
+			"description" -> "Cell Evaluated Successfully"
+		|>
+	|>];
+
+	sendMessage[state["client"], <|
+		"id" -> msg["id"],
+		"result" -> Null
+	|>];
+
+	{"Continue", state}
 ]
 
 
@@ -1517,7 +1591,7 @@ handleNotification["textDocument/didClose", msg_, state_] := With[
 		uri = msg["params"]["textDocument"]["uri"]
 	},
 
-	LogDebug @ ("Close Document " <> uri);
+	LogInfo @ ("Close Document " <> uri);
 
 	state
 	// ReplaceKeyBy[{"openedDocs"} -> KeyDrop[uri]]
@@ -1705,10 +1779,65 @@ handleResponse["workspace/applyEdit", msg_, state_WorkState] := (
 (*Handle Dap Request*)
 
 
-handleDapRequest["initialize", msg_, state_WorkState] := (
-	sendResponse[state["debugSession"]["client"], <|
+(* ::Subsection:: *)
+(*initialize*)
+
+
+handleDapRequest["initialize", msg_, state_WorkState] := Block[
+	{
+		subKernel = LaunchKernels[1] // First,
+		context = ToString[Unique["debug"]]
+	},
+
+    sendMessage[state["debugSession"]["client"], <|
+        "type" -> "response",
+        "request_seq" -> msg["seq"],
+        "success" -> True,
+        "command" -> msg["command"],
+        "body" -> <|
+			"supportsEvaluateForHovers" -> True
+        |>
+    |>];
+
+	$DistributedContexts = None;
+	StringJoin[
+		context, "`SymbolTable = <||>;",
+		"$NewSymbol = ((", context, "`SymbolTable =
+			Merge[{", context, "`SymbolTable, <|#2 -> #1|>}, Flatten]
+		)&)"
+	] // ParallelEvaluate[
+		ToExpression[#],
+		subKernel
+	]&;
+
+    state
+    // ReplaceKeyBy["debugSession" -> (
+		Fold[ReplaceKey, #, {
+			"initialized" -> True,
+			"subKernel" -> subKernel,
+			"context" -> context,
+			"thread" -> DapThread[<|
+				"id" -> ParallelEvaluate[$ProcessID, subKernel],
+				"name" -> StringJoin[
+					"SubKernel ",
+					ParallelEvaluate[$KernelID, subKernel]
+					// ToString
+				]
+			|>],
+			"symbolTable" -> <||>
+		}]&)]
+    // applyEdit["dummyAll", #]&
+]
+
+
+(* ::Subsection:: *)
+(*attach*)
+
+
+handleDapRequest["attach", msg_, state_WorkState] := (
+	sendMessage[state["debugSession"]["client"], <|
 		"type" -> "response",
-		"request_seq" -> msg["request_seq"],
+		"request_seq" -> msg["seq"],
 		"success" -> True,
 		"command" -> msg["command"],
 		"body" -> <|
@@ -1716,11 +1845,147 @@ handleDapRequest["initialize", msg_, state_WorkState] := (
 		|>
 	|>];
 
+	sendMessage[state["debugSession"]["client"], <|
+		"type" -> "event",
+		"event" -> "initialized"
+	|>];
+
+	sendMessage[state["debugSession"]["client"], <|
+		"type" -> "event",
+		"event" -> "process",
+		"body" -> <|
+			"name" -> "wolfram.exe",
+			"systemProcessId" -> state["debugSession"]["thread"]["id"],
+			"isLocalProcess" -> True,
+			"startMethod" -> "attach"
+		|>
+	|>];
+
+	sendMessage[state["debugSession"]["client"], <|
+		"type" -> "event",
+		"event" -> "thread",
+		"body" -> <|
+			"reason" -> "wolfram.exe",
+			"threadId" -> state["debugSession"]["thread"]["id"]
+		|>
+	|>];
+
+
+	{"Continue", state}
+)
+
+
+(* ::Subsection:: *)
+(*disconnect*)
+
+
+handleDapRequest["disconnect", msg_, state_WorkState] := (
+	sendMessage[state["debugSession"]["client"], <|
+		"type" -> "response",
+		"request_seq" -> msg["seq"],
+		"success" -> True,
+		"command" -> msg["command"],
+		"body" -> <||>
+	|>];
+
+	state
+	// ReplaceKey[{"debugSession", "initialized"} -> False]
+	// ReplaceKey[{"debugSession", "client"} -> Null]
+	// applyEdit["dummyAll", #]&
+)
+
+
+(* ::Subsection:: *)
+(*setBreakpoints*)
+
+
+handleDapRequest["setBreakPoints", msg_, state_WorkState] := (
+	sendMessage[state["debugSession"]["client"], <|
+		"type" -> "response",
+		"request_seq" -> msg["seq"],
+		"success" -> True,
+		"command" -> msg["command"],
+		"body" -> <|
+			"breakpoints" -> {}
+		|>
+	|>];
+
+	{"Continue", state}
+)
+
+
+(* ::Subsection:: *)
+(*threads*)
+
+
+handleDapRequest["threads", msg_, state_WorkState] := (
+	sendMessage[state["debugSession"]["client"], <|
+		"type" -> "response",
+		"request_seq" -> msg["seq"],
+		"success" -> True,
+		"command" -> msg["command"],
+		"body" -> <|
+			"threads" -> {
+				state["debugSession"]["thread"]
+				// ToAssociation
+			}
+		|>
+	|>];
+
+	{"Continue", state}
+)
+
+
+(* ::Subsection:: *)
+(*evaluate*)
+
+
+handleDapRequest["evaluate", msg_, state_WorkState] := Block[ 
 	{
-		"Continue",
-		state
-		// ReplaceKey[{"debugSession", "initialized"} -> True]
-	}
+		text
+	},
+
+	text = msg["arguments"]["expression"];
+	res = With[{text = text},
+		ParallelEvaluate[
+			ToExpression[text],
+			state["debugSession"]["subKernel"]
+		]
+	] // ToString;
+
+	sendMessage[state["debugSession"]["client"], <|
+		"type" -> "response",
+		"request_seq" -> msg["seq"],
+		"success" -> True,
+		"command" -> msg["command"],
+		"body" -> <|
+			"result" -> res
+		|>
+	|>];
+
+	{"Continue", state}
+ ]
+
+
+(* ::Subsection:: *)
+(*Invalid Dap Request*)
+
+
+handleDapRequest[_, msg_, state_] := (
+	sendMessage[state["debugSession"]["client"], <|
+		"type" -> "response",
+		"request_seq" -> msg["seq"],
+		"success" -> False,
+		"command" -> msg["command"],
+		"body" -> <|
+			"error" -> <|
+				"id" -> msg["seq"],
+				"format" -> ErrorMessageTemplates["DapRequestNotFound"][msg["command"]]
+			|>
+		|>
+	|>];
+
+	{"Continue", state}
 )
 
 
@@ -1787,7 +2052,8 @@ ServerError[errorType_String, msg_String] := (
 
 
 ErrorMessageTemplates = <|
-	"MethodNotFound" -> StringTemplate["The requested method `method` is invalid or not implemented"]
+	"MethodNotFound" -> StringTemplate["The requested method \"`method`\" is invalid or not implemented"],
+	"DapRequestNotFound" -> StringTemplate["The request \"`command`\" is invalid or not implemented"]
 |>
 
 

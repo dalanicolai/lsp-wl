@@ -31,6 +31,7 @@ CodeLens::usage = "is type of CodeLens Interface in LSP."
 ColorInformation::usage = "is the type of ColorInformation interface in LSP."
 LspColor::usage = "is the type of Color interface in LSP."
 ColorPresentation::usage = "is the type of ColorPresentation interface in LSP."
+DapThread::usage = "is the type of Thread interface in DAP."
 
 (* ::Section:: *)
 (*Type Aliases*)
@@ -169,7 +170,7 @@ Needs["DataType`"]
 
 
 (* ::Section:: *)
-(*Server Communication Related Type*)
+(*Language Server Types*)
 
 DeclareType[LspPosition, <|
     "line" -> _Integer,
@@ -298,6 +299,17 @@ DeclareType[ColorPresentation, <|
     "textEdit" -> _TextEdit,
     "additionalTextEdits" -> {__TextEdit}
 |>]
+
+
+(* ::Section:: *)
+(*Debug Adaptor Types*)
+
+
+DeclareType[DapThread, <|
+    "id" -> _?NumericQ,
+    "name" -> _String
+|>]
+
 
 End[]
 
